@@ -1,0 +1,38 @@
+---
+title: "Shrinking a chat widget 80% by dropping the UI library"
+date: "2026.02.10"
+read: "7 min"
+tags: ["Svelte", "Performance", "Bundles"]
+excerpt: "When the dependency carrying you starts costing you Core Web Vitals on someone else's site, it's time to write the components yourself."
+---
+
+The FluentBot chat widget embeds on customers' marketing pages. Which means its bundle isn't our problem — it's *their* Largest Contentful Paint. A UI library that felt free in our app was very much not free on theirs.
+
+## The measurement that started it
+
+A customer flagged a Core Web Vitals regression after embedding us. The widget shipped ~220kB of JS to render what is, structurally, a button and a scroll area.
+
+<Callout type="tip" badge="good idea">
+A dependency's cost is paid by whoever loads it. On an embedded widget, that's never you — it's the host page.
+</Callout>
+
+## What we cut
+
+I catalogued every UI primitive actually in use — it was a short list. Each got rebuilt as a small vanilla Svelte component, scoped to a shadow root so it couldn't leak into (or inherit from) the host page.
+
+```ts title="widget/Button.svelte"
+<script lang="ts">
+  export let onClick: () => void;
+  export let label: string;
+</script>
+
+<button class="fb-btn" on:click={onClick}>{label}</button>
+```
+
+Runtime CSS-in-JS went too, replaced by static utility classes compiled at build.
+
+<PullQuote>Same feature surface. A fifth of the bytes. The only thing the host page noticed was its LCP getting better.</PullQuote>
+
+## Result
+
+The shipped bundle dropped **~80%**, the embed went iframe-free, and the feature set didn't change. The lesson generalises: on anything you embed elsewhere, treat every kilobyte as someone else's budget.

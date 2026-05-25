@@ -1,0 +1,45 @@
+---
+title: "Migrating a RAG stack from LangChain.js to Python — and why"
+date: "2026.03.02"
+read: "12 min"
+tags: ["Python", "LangChain", "Migration"]
+excerpt: "We didn't move because Python was faster. We moved because the JS ecosystem was outpacing us in the wrong direction."
+---
+
+We started FluentBot in TypeScript because that's where the product lived. A year in, the RAG core moved to Python. This is the honest version of why — runtime speed had almost nothing to do with it.
+
+<PullQuote>You don't migrate a language for milliseconds. You migrate it for the libraries you'll lean on for the next two years.</PullQuote>
+
+## The thing JS was quietly costing us
+
+LangChain.js shipped fast and broke often. Every retriever pattern we wanted — parent-document, multi-query, self-query — was either a release behind the Python package or stitched together from three half-maintained community ports.
+
+The tax wasn't runtime. It was **us**: every architecture experiment took a day of gluing instead of an hour of wiring.
+
+<Callout type="warn" badge="honest take">
+The migration cost two real weeks. The payoff was iteration speed on the architecture — the only optimisation that compounds.
+</Callout>
+
+## What the move actually looked like
+
+The retriever that took a hundred lines of glue in JS was a dozen in Python:
+
+```python title="rag/retriever.py"
+from langchain.retrievers import ParentDocumentRetriever
+from langchain.storage import SQLDocStore
+
+retriever = ParentDocumentRetriever(
+    vectorstore=chroma,
+    docstore=SQLDocStore("postgres://..."),
+    child_splitter=RecursiveCharacterTextSplitter(chunk_size=220),
+    parent_splitter=RecursiveCharacterTextSplitter(chunk_size=1400),
+)
+```
+
+## Orchestration with LangGraph
+
+The "if cache → return, else → retrieve → rerank → generate → cache" loop became a graph instead of a stack of try/excepts. Chat memory landed in PostgreSQL, next to everything else.
+
+## Would I do it again
+
+Yes — but earlier. The longer you wait, the more JS-shaped assumptions calcify into the codebase. Pick the language your libraries live in, not the one that benchmarks well.

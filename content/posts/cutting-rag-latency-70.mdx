@@ -1,0 +1,128 @@
+---
+title: "Cutting RAG response latency 70%: what actually moved the needle"
+date: "2026.04.18"
+read: "9 min"
+tags: ["RAG", "Latency", "Postmortem"]
+excerpt: "Six weeks, four false starts, one boring fix. A field report on what we actually changed to get from 30s to 6–11s."
+numbered: false
+---
+
+<p className="lede">FluentBot answered correctly from day one. It just took half a minute to do it. This is the story of how three boring decisions and one painful migration shaved that round-trip down to 6–11 seconds — and which of them actually mattered.</p>
+
+<StickyNote label="tl;dr · the boring fix won" list>
+
+- **Parent-document retrieval** dropped tokens-in-prompt ~55% — biggest single win.
+- **Redis semantic cache** served hot queries in < 1.5s.
+- **Python migration** wasn't about speed; it was about ergonomics.
+- Switching models? Didn't move the needle.
+
+</StickyNote>
+
+<H2 id="problem" n="01 · context" doodle="star">The 30-second problem</H2>
+
+The first cut of FluentBot — an AI-powered customer-support agent built on Retrieval-Augmented Generation — was right but unusable. The retriever found the right documents. The model wrote sensible answers. And the end-to-end round-trip averaged ~30s.
+
+30 seconds is enough time for a customer to close the tab, file a ticket the bot would have answered, and refresh the page assuming something broke. We had a working system that was somehow shipping a worse experience than no system.
+
+<PullQuote>30s is enough time for a customer to close the tab, file the ticket the bot would have answered, and refresh assuming something broke.</PullQuote>
+
+<H2 id="measure" n="02 · diagnosis" doodle="target">What we measured first</H2>
+
+The fastest move in a latency post-mortem is to stop guessing. Before changing anything we wired tracing around every span of one request: `retrieve` → `rerank` → `prompt` → `generate` → `post-process`. The shape of the bill was almost insulting:
+
+<Compare>
+  <CompareCol label="Round-trip budget · before" title="Where the 30s went">
+    <CRow k="retrieve chunks" v="~8s" hot />
+    <CRow k="rerank" v="~2s" />
+    <CRow k="prompt build" v="~0.4s" />
+    <CRow k="LLM generate" v="~17s" />
+    <CRow k="post-process" v="~2s" />
+  </CompareCol>
+  <CompareCol label="After" title="Where the 6–11s goes">
+    <CRow k="retrieve parents" v="~1.2s" hot />
+    <CRow k="rerank" v="~0.6s" />
+    <CRow k="prompt build" v="~0.2s" />
+    <CRow k="LLM generate" v="~4–8s" hot />
+    <CRow k="post-process" v="~0.3s" />
+  </CompareCol>
+</Compare>
+
+Two things jumped: retrieval was returning so many tiny chunks that we were paying for context we then mostly threw away, and the LLM was being asked to read a small book before it answered. The thing that moved the needle wasn't the impressive thing.
+
+<H2 id="parent-doc" n="03 · architecture" doodle="docs">The real unlock: parent-document retrieval</H2>
+
+The retriever was indexing 200-token chunks for precision — which is great for recall, terrible for the model's reading list. We swapped to a parent-document setup: index the small chunks for retrieval, but pass **parent documents** into the prompt. Same precision on lookup, half the tokens going to the LLM.
+
+```python title="rag/retrieve.py"
+# index small chunks; return their parents at query time
+from langchain.retrievers import ParentDocumentRetriever
+from langchain.storage import SQLDocStore
+
+retriever = ParentDocumentRetriever(
+    vectorstore=chroma,
+    docstore=SQLDocStore("postgres://..."),
+    child_splitter=RecursiveCharacterTextSplitter(chunk_size=220),
+    parent_splitter=RecursiveCharacterTextSplitter(chunk_size=1400),
+    search_kwargs={"k": 4},
+)
+
+async def answer(query: str) -> str:
+    docs = await retriever.aget_relevant_documents(query)
+    # 4 parents · ~1.4k tokens each vs. 12 chunks · ~3k total
+    return await llm.ainvoke(build_prompt(query, docs))
+```
+
+Parent-document retrieval dropped tokens-in-prompt by ~55%. The LLM's generate time fell almost linearly with it. This was, embarrassingly, the single biggest contributor to the 70% number — and it was a one-week change.
+
+<StickyNote tone="coral" label="key takeaway" tilt={2.2} max={380} align="right">If retrieval is fast, the LLM gets fast — almost for free.</StickyNote>
+
+<Callout type="tip" badge="good idea">
+If your latency problem looks like an LLM problem, double-check whether you're really shipping the model a small library to read. Token count is upstream of almost every "make the model faster" intervention.
+</Callout>
+
+<H2 id="semcache" n="04 · caching" doodle="redis">Redis semantic cache</H2>
+
+Once retrieval was fast and prompts were lean, the rest of the gain came from **not asking the model the same question twice**. Customer-support traffic is famously bursty and famously repetitive — "how do I reset my password" arrives a hundred times a day in eight variants.
+
+We added a Redis-backed semantic cache: hash the embedding of the query, look for a near-neighbour above a tuned cosine threshold, and if it hits, serve the prior answer. Cached hits land in under 1.5s.
+
+```python title="rag/cache.py"
+async def answer_cached(query: str) -> str:
+    emb = await embed(query)
+    if hit := await redis_semcache.lookup(emb, threshold=0.92):
+        metrics.incr("semcache.hit")
+        return hit.answer
+
+    answer = await answer(query)
+    await redis_semcache.put(emb, answer, ttl=7 * 86400)
+    return answer
+```
+
+Two notes from production. First: tune the cosine threshold against a real query log — at 0.85 we got near-duplicates that meant different things; at 0.95 the cache barely fired. 0.92 was where false positives went to zero on our corpus. Second: invalidate on knowledge-base writes, ruthlessly. Stale "right" answers are worse than slow new ones.
+
+<H2 id="migration" n="05 · platform" doodle="arrow">The Python migration tax</H2>
+
+None of the above would have been pleasant in LangChain.js. We migrated the RAG core from JavaScript to Python mid-flight — not because Python is intrinsically faster, but because the vector-store and retriever ergonomics we wanted were a generation ahead in the Python ecosystem. `ParentDocumentRetriever` with a SQL docstore took about a hundred lines. Building the same thing on the JS side meant gluing together three half-maintained libraries.
+
+<Callout type="warn" badge="honest take">
+The migration cost a real two weeks. The argument for it wasn't speed of the runtime — it was speed of *us*. Faster iteration on the architecture is the only optimisation that compounds.
+</Callout>
+
+We orchestrated the new pipeline with **LangGraph**, which made the "if cache → return, else → retrieve → rerank → generate → cache" loop expressible as a graph instead of a stack of try/excepts. Chat memory landed in PostgreSQL where the rest of the app already lived.
+
+<StickyNote tone="mint" label="field note" tilt={-2.4} max={360}>Pick the language your **libraries** live in — not the one that benchmarks well.</StickyNote>
+
+<H2 id="outcome" n="06 · outcome" doodle="bigstar">Outcome & what I'd do again</H2>
+
+The headline number is **−70% latency, 30s → 6–11s**. Cached hits sit comfortably under 1.5s. Tokens-in-prompt fell ~55%; tokens-in spend fell roughly the same.
+
+If I were starting over, in order:
+
+- **Instrument before you optimise.** Adding spans before changing code is boring and it's always right.
+- **Spend tokens like cash.** The cheapest unit of latency is the one you didn't send.
+- **Cache embeddings, not just answers.** The embedding call is small money per request but huge in aggregate.
+- **Let the ecosystem do its job.** Don't fight the language a library was designed in.
+
+And the thing that absolutely did not matter: switching models. We tested the same architecture across three providers. The variance between them was less than the variance between "good retrieval" and "bad retrieval."
+
+*— H, writing from Sylhet, somewhere in the rainy season.*
